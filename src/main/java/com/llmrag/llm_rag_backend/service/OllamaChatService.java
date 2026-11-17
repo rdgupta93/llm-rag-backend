@@ -12,6 +12,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 @Service
 public class OllamaChatService {
 
@@ -20,6 +23,9 @@ public class OllamaChatService {
 
     private static final String MODEL_NAME =
             "qwen2.5:3b-instruct";
+
+    private static final Logger log =
+            LoggerFactory.getLogger(OllamaChatService.class);
 
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
@@ -198,11 +204,37 @@ public class OllamaChatService {
         If the supplied evidence does not contain the information
         needed to answer the question, do not guess.
 
-        If the evidence does not contain the requested information,
-        return:
+                If the retrieved evidence explicitly establishes that the
+                requested information is not specified, return exactly this
+                format:
                 
-        NOT_SPECIFIED: <state the specific information that the
-        retrieved evidence does not specify>
+                NOT_SPECIFIED: The retrieved evidence does not specify
+                [the specific information requested by the user].
+                
+                Generate the requested information dynamically from the
+                user's question. Do not hardcode topic names or predefined
+                topic-specific answers.
+                
+                Examples of the expected answer format:
+                - NOT_SPECIFIED: The retrieved evidence does not specify
+                  retirement contributions.
+                - NOT_SPECIFIED: The retrieved evidence does not specify
+                  health insurance coverage.
+                - NOT_SPECIFIED: The retrieved evidence does not specify
+                  the annual bonus amount.
+                - NOT_SPECIFIED: The retrieved evidence does not specify
+                  maternity leave.
+                
+                These examples illustrate the format only. They are not facts
+                to copy into unrelated answers.
+                
+                Do not return general explanations about missing evidence.
+                Do not state that a benefit or policy does not exist merely
+                because its details are unspecified.
+                
+                If the retrieved evidence does not establish that the
+                requested information is unspecified, do not assume it is
+                missing. Follow the existing evidence-insufficiency rules.
                 
         If a passage explicitly documents that the information is
         unspecified, preserve that specific detail in your response.
@@ -267,34 +299,31 @@ public class OllamaChatService {
 
 
         String userPrompt = """
-        Answer the user's actual question using only the supplied evidence.
+Answer the user's question using only the evidence below.
 
-        Requirements:
-        1. Answer the specific question asked. Do not force a fixed
-           number of paragraphs or discuss unrelated topics.
-        2. Return only the direct answer to the question.
-           Do not add meta-commentary such as "This information is
-           directly stated in the document" or "According to the handbook."
-        3. Preserve numerical values and their associations exactly
-           as supported by the evidence.
-        4. Every factual paragraph must end with exactly one source
-           citation copied verbatim from a supporting evidence label.
-        5. Never invent, modify, or guess a source citation.
-        6. Do not treat citation examples, instructions, headings,
-           or OCR fragments as factual evidence.
-        7. If the evidence does not support the requested detail,
-           clearly state that it cannot be verified from the
-           retrieved evidence. Do not guess.
-        8. Keep the answer concise but complete. Do not add an
-           unrelated conclusion, introduction, or summary.
-        9. Return only the answer text.
+Requirements:
+- Give a direct and complete answer.
+- For numerical answers, include the relevant unit
+  and context.
+- Do not return only a number.
+- Do not add unrelated information.
+- Do not contradict a fact stated in the evidence.
+- If the answer is explicitly stated, provide it.
+- If the information is explicitly unspecified,
+  return NOT_SPECIFIED in the required format.
+- Never guess.
 
-        EVIDENCE:
-        %s
+EVIDENCE:
 
-        QUESTION:
-        %s
-        """.formatted(context, question);
+%s
+
+QUESTION:
+
+%s
+
+Return only the answer text.
+""".formatted(context, question);
+
 
 
         var requestBody = objectMapper.createObjectNode();
@@ -363,46 +392,37 @@ public class OllamaChatService {
         }
 
         String systemPrompt = """
-    You are a strict evidence verification classifier.
+You are a document-grounded question-answering assistant.
 
-    Compare ONE proposed answer claim against ONE supplied source passage.
-    The source passage is the only permitted evidence.
+Use only the supplied document passages to answer the user's question.
 
-    Return exactly one label:
-    SUPPORTED
-    UNSUPPORTED
-    UNCERTAIN
+Rules:
 
-    SUPPORTED:
-    - The passage supports the actual substantive claim.
-    - Every material detail in the claim is supported.
-    - For numerical claims, the number is clearly associated with
-      the correct model, benchmark, metric, and experimental setting
-      whenever those details are included in the claim.
+1. Answer only the specific question asked.
+2. Write complete, grammatical sentences.
+3. Never return a bare number as an answer.
+   Always include the relevant subject, unit and context.
+4. Preserve numerical values and units exactly as stated
+   in the evidence.
+5. Do not combine unrelated facts from different passages.
+6. Do not add contradictory or repetitive statements.
+7. Do not infer information that is not supported.
+8. If a passage explicitly states that the requested
+   information is not specified, return:
 
-    UNSUPPORTED:
-    - The passage contradicts the claim, or
-    - The passage does not provide meaningful evidence for the claim, or
-    - The proposed answer is merely an OCR fragment, broken table text,
-      heading, citation template, or instruction rather than a supported
-      factual statement answering the question.
+   NOT_SPECIFIED: The retrieved evidence does not specify
+   [specific requested information].
 
-    UNCERTAIN:
-    - OCR corruption prevents verification of a material detail.
-    - A number appears, but its association with a model, benchmark,
-      metric, or experimental setting is unclear.
-    - The evidence partially supports the claim but leaves a material
-      detail unresolved.
+9. Return NOT_SPECIFIED only when the evidence explicitly
+   establishes that the information is unspecified.
+10. If evidence is insufficient, say that the answer
+    cannot be verified from the retrieved evidence.
+11. Do not generate citations. The application will
+    identify and attach supporting citations.
+12. Do not include introductory explanations or summaries.
 
-    Strict rules:
-    - Matching words or numbers alone is not sufficient.
-    - Verify the relationship between the claim and its evidence.
-    - Do not infer missing facts from outside knowledge.
-    - Do not reject a claim merely because it is paraphrased.
-    - Do not mark an ambiguous numerical association SUPPORTED.
-    - Do not treat a valid citation label as proof of factual accuracy.
-    - Return only one label, without explanation.
-    """;
+Return only the answer text.
+""";
 
 
 
@@ -472,9 +492,16 @@ public class OllamaChatService {
         String rawResponse =
                 root.path("message").path("content").asText("");
 
-        System.out.println("EVIDENCE CLAIM: " + claim);
-        System.out.println("EVIDENCE SOURCE: " + sourceText);
-        System.out.println("EVIDENCE RAW RESPONSE: " + rawResponse);
+        log.debug(
+                "Evidence evaluation started | claim={} | sourceLength={}",
+                claim,
+                sourceText.length()
+        );
+
+        log.info(
+                "Evidence judge response | rawVerdict={}",
+                rawResponse
+        );
 
         String verdict = root.path("message")
                 .path("content")
@@ -485,9 +512,15 @@ public class OllamaChatService {
         if (verdict.equals("SUPPORTED")
                 || verdict.equals("UNSUPPORTED")
                 || verdict.equals("UNCERTAIN")) {
+
+            log.info("Evidence verdict normalized to {}", verdict);
             return verdict;
         }
 
+        log.warn(
+                "Unexpected evidence judge response; using UNCERTAIN | rawVerdict={}",
+                verdict
+        );
         return "UNCERTAIN";
     }
 
